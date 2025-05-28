@@ -8,25 +8,27 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use zip::ZipArchive;
-
-// Add these imports for natural sorting
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 
 struct MangaReader {
-    current_image: Option<TextureHandle>,
-    current_path: Option<PathBuf>,
-    files_in_folder: Vec<PathBuf>,
-    current_index: usize,
-    zoom: f32,
-    offset_x: f32,
-    offset_y: f32,
-    dragging: bool,
-    drag_start: Option<egui::Pos2>,
-    last_pos: Option<egui::Pos2>,
+    current_image: Option<TextureHandle>, // Handle to the currently displayed image
+    current_path: Option<PathBuf>, // Path of the currently opened file
+    files_in_folder: Vec<PathBuf>, // List of image files in the current directory or archive
+    current_index: usize, // Index of the currently displayed image
+    zoom: f32, // Current zoom level
+    offset_x: f32, // Horizontal offset for panning
+    offset_y: f32, // Vertical offset for panning
+    dragging: bool, // Whether the user is currently dragging the image
+    drag_start: Option<egui::Pos2>, // Starting position of the drag
+    last_pos: Option<egui::Pos2>, // Last position during dragging
     status_message: Option<(String, f32)>, // Message and duration
-    fullscreen: bool,
-    auto_fit: bool,
+    fullscreen: bool, // Whether the app is in fullscreen mode
+    auto_fit: bool, // Whether to automatically fit images to view
+    archive_files: Vec<PathBuf>, // List of archive files in directory
+    current_archive_index: usize, // Index of the currently displayed archive file
+    show_last_image_alert: bool, // Whether to show alert when reaching the last image in an archive
+    is_in_archive: bool, // Whether the current image is from an archive
 }
 
 // Implement natural sorting for filenames
@@ -92,6 +94,10 @@ impl Default for MangaReader {
             status_message: None,
             fullscreen: false,
             auto_fit: true,
+            archive_files: Vec::new(),
+            current_archive_index: 0,
+            show_last_image_alert: false,
+            is_in_archive: false,
         }
     }
 }
@@ -127,6 +133,31 @@ impl MangaReader {
         self.status_message = Some((message, duration));
     }
 
+    fn is_archive_file(path: &Path) -> bool {
+        if let Some(extension) = path.extension() {
+            let ext = extension.to_string_lossy().to_lowercase();
+            ext == "cbz" || ext == "zip"
+        } else {
+            false
+        }
+    }
+
+    fn list_archive_files_in_directory(&mut self, dir: &Path) -> Result<()> {
+        self.archive_files.clear();
+        
+        for entry in WalkDir::new(dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() && Self::is_archive_file(path) {
+                self.archive_files.push(path.to_path_buf());
+            }
+        }
+        
+        // Use natural sorting for archive files
+        self.archive_files.sort_by(|a, b| natural_sort_paths(a, b));
+        
+        Ok(())
+    }
+
     fn open_file(&mut self, path: &Path, ctx: &egui::Context) -> Result<()> {
         self.current_path = Some(path.to_path_buf());
         
@@ -134,9 +165,11 @@ impl MangaReader {
         self.zoom = 1.0;
         self.offset_x = 0.0;
         self.offset_y = 0.0;
+        self.show_last_image_alert = false;
         
         // If path is a directory, list image files
         if path.is_dir() {
+            self.is_in_archive = false;
             self.list_image_files_in_directory(path)?;
             if !self.files_in_folder.is_empty() {
                 let first_file = self.files_in_folder[0].clone();
@@ -151,17 +184,26 @@ impl MangaReader {
         }
         
         // Check if path is a CBZ/ZIP file
-        if let Some(extension) = path.extension() {
-            let ext = extension.to_string_lossy().to_lowercase();
-            if ext == "cbz" || ext == "zip" {
-                self.load_cbz(path, ctx)
-                    .with_context(|| format!("Failed to load archive: {}", path.display()))?;
-                self.set_status(format!("Opened archive: {}", path.display()), 3.0);
-                return Ok(());
+        if Self::is_archive_file(path) {
+            self.is_in_archive = true;
+            // List archive files in the same directory for auto-loading
+            if let Some(parent) = path.parent() {
+                self.list_archive_files_in_directory(parent)?;
+                // Find the index of the current archive
+                self.current_archive_index = self.archive_files
+                    .iter()
+                    .position(|p| p == path)
+                    .unwrap_or(0);
             }
+            
+            self.load_cbz(path, ctx)
+                .with_context(|| format!("Failed to load archive: {}", path.display()))?;
+            self.set_status(format!("Opened archive: {}", path.display()), 3.0);
+            return Ok(());
         }
         
         // Otherwise, assume it's an image file
+        self.is_in_archive = false;
         self.load_image(path, ctx)
             .with_context(|| format!("Failed to load image: {}", path.display()))?;
         self.set_status(format!("Opened image: {}", path.display()), 3.0);
@@ -315,20 +357,56 @@ impl MangaReader {
         }
     }
 
+    fn load_next_archive(&mut self, ctx: &egui::Context) -> Result<bool> {
+        if self.archive_files.is_empty() {
+            return Ok(false);
+        }
+        
+        let next_index = self.current_archive_index + 1;
+        if next_index < self.archive_files.len() {
+            let next_archive = self.archive_files[next_index].clone();
+            self.current_archive_index = next_index;
+            self.current_path = Some(next_archive.clone());
+            self.load_cbz(&next_archive, ctx)?;
+            self.set_status(format!("Loaded next archive: {}", next_archive.file_name().unwrap_or_default().to_string_lossy()), 3.0);
+            Ok(true)
+        } else {
+            self.set_status("No more archives to load".to_string(), 3.0);
+            Ok(false)
+        }
+    }
+
     fn next_image(&mut self, ctx: &egui::Context) -> Result<()> {
         if self.files_in_folder.is_empty() {
             return Ok(());
         }
         
+        // Check if we're at the last image in an archive
+        if self.is_in_archive && self.current_index == self.files_in_folder.len() - 1 {
+            if self.show_last_image_alert {
+                // Second scroll - try to load next archive
+                self.show_last_image_alert = false;
+                if !self.load_next_archive(ctx)? {
+                    // No more archives, stay at current image
+                    return Ok(());
+                }
+                return Ok(());
+            } else {
+                // First scroll at last image - show alert
+                self.show_last_image_alert = true;
+                self.set_status("Reaching last image. Scroll again to load next archive.".to_string(), 3.0);
+                return Ok(());
+            }
+        }
+        
+        // Normal navigation
+        self.show_last_image_alert = false;
         self.current_index = (self.current_index + 1) % self.files_in_folder.len();
         let path = self.files_in_folder[self.current_index].clone();
         
         if let Some(current_path) = &self.current_path {
             let current_path_clone = current_path.clone();
-            if current_path.extension().map_or(false, |ext| {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                ext_str == "cbz" || ext_str == "zip"
-            }) {
+            if self.is_in_archive {
                 // Inside a CBZ/ZIP file
                 self.load_cbz_image(&current_path_clone, &path, ctx)?;
             } else {
@@ -345,6 +423,9 @@ impl MangaReader {
             return Ok(());
         }
         
+        // Reset alert state when going backwards
+        self.show_last_image_alert = false;
+        
         self.current_index = if self.current_index == 0 {
             self.files_in_folder.len() - 1
         } else {
@@ -355,10 +436,7 @@ impl MangaReader {
         
         if let Some(current_path) = &self.current_path {
             let current_path_clone = current_path.clone();
-            if current_path.extension().map_or(false, |ext| {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                ext_str == "cbz" || ext_str == "zip"
-            }) {
+            if self.is_in_archive {
                 // Inside a CBZ/ZIP file
                 self.load_cbz_image(&current_path_clone, &path, ctx)?;
             } else {
@@ -478,6 +556,35 @@ impl App for MangaReader {
             if *duration <= 0.0 {
                 self.status_message = None;
             }
+        }
+
+        // Show alert modal if at last image
+        if self.show_last_image_alert {
+            egui::Window::new("Last Image")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label("You've reached the last image in this archive.");
+                        ui.add_space(10.0);
+                        
+                        if self.current_archive_index + 1 < self.archive_files.len() {
+                            ui.label("Scroll again to load the next archive:");
+                            if let Some(next_archive) = self.archive_files.get(self.current_archive_index + 1) {
+                                ui.label(format!("{}", next_archive.file_name().unwrap_or_default().to_string_lossy()));
+                            }
+                        } else {
+                            ui.label("No more archives available.");
+                        }
+                        
+                        ui.add_space(10.0);
+                        
+                        if ui.button("OK").clicked() {
+                            self.show_last_image_alert = false;
+                        }
+                    });
+                });
         }
         
         if !self.fullscreen {
@@ -646,22 +753,43 @@ impl MangaReader {
         }
             
         // Handle zoom with mouse wheel
-        let scroll = ctx.input(|i| i.raw_scroll_delta.y);
+        // Handle mouse wheel - zoom if Ctrl is held, otherwise navigate
+        let (scroll, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
         if scroll != 0.0 {
-            let zoom_delta = if scroll > 0.0 { 1.2 } else { 0.8 };
-            if let Some(hover_pos) = response.hover_pos() {
-                let center_x = image_rect.center().x;
-                let center_y = image_rect.center().y;
+            if ctrl_held {
+                // Zoom functionality when Ctrl is held
+                let zoom_factor = if scroll > 0.0 { 1.1 } else { 0.9 };
+                let old_zoom = self.zoom;
+                self.zoom *= zoom_factor;
+                
+                // Clamp zoom to reasonable bounds
+                self.zoom = self.zoom.clamp(0.1, 10.0);
+                
+                // Zoom towards mouse cursor position for better UX
+                if let Some(hover_pos) = response.hover_pos() {
+                    let zoom_change = self.zoom / old_zoom;
+                    let center_x = image_rect.center().x;
+                    let center_y = image_rect.center().y;
                     
-                // Zoom toward cursor position
-                let dx = hover_pos.x - center_x - self.offset_x;
-                let dy = hover_pos.y - center_y - self.offset_y;
+                    // Calculate the point relative to the image center
+                    let relative_x = hover_pos.x - center_x - self.offset_x;
+                    let relative_y = hover_pos.y - center_y - self.offset_y;
                     
-                self.offset_x += dx * (1.0 - zoom_delta);
-                self.offset_y += dy * (1.0 - zoom_delta);
-                self.zoom *= zoom_delta;
+                    // Adjust offset to zoom towards cursor
+                    self.offset_x -= relative_x * (zoom_change - 1.0);
+                    self.offset_y -= relative_y * (zoom_change - 1.0);
+                }
             } else {
-                self.zoom *= zoom_delta;
+                // Navigation functionality when Ctrl is not held
+                if scroll > 0.0 {
+                    if let Err(e) = self.previous_image(ctx) {
+                        self.set_status(format!("Error: {}", e), 5.0);
+                    }
+                } else {
+                    if let Err(e) = self.next_image(ctx) {
+                        self.set_status(format!("Error: {}", e), 5.0);
+                    }
+                }
             }
         }
             
@@ -765,8 +893,9 @@ fn main() -> Result<()> {
     
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
+            .with_inner_size([1920.0, 1080.0])
             .with_title("Manga Reader")
+            .with_maximized(true)
             .with_icon(load_icon()),
         ..Default::default()
     };
