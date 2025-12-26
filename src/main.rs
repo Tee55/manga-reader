@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
+use std::os::windows::fs::MetadataExt;
 
 struct MangaReader {
     current_image: Option<TextureHandle>, // Handle to the currently displayed image
@@ -224,17 +225,45 @@ impl MangaReader {
     fn list_image_files_in_directory(&mut self, dir: &Path) -> Result<()> {
         self.files_in_folder.clear();
         
-        for entry in WalkDir::new(dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+        println!("Scanning directory: {}", dir.display());
+        
+        // Use WalkDir instead of read_dir to access hidden files
+        for entry in WalkDir::new(dir)
+            .max_depth(1)  // Don't recurse into subdirectories
+            .into_iter()
+            .filter_map(|e| e.ok()) 
+        {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(extension) = path.extension() {
-                    let ext = extension.to_string_lossy().to_lowercase();
-                    if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
-                        self.files_in_folder.push(path.to_path_buf());
-                    }
+            
+            // Skip the directory itself, only process files
+            if !path.is_file() {
+                continue;
+            }
+            
+            // Check file attributes to skip hidden/system files (like Cortex XDR decoys)
+            if let Ok(metadata) = path.metadata() {
+                const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+                const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+                
+                let attributes = metadata.file_attributes();
+                
+                // Skip hidden or system files
+                if (attributes & FILE_ATTRIBUTE_HIDDEN) != 0 || (attributes & FILE_ATTRIBUTE_SYSTEM) != 0 {
+                    println!("Skipping hidden/system file: {}", path.display());
+                    continue;
+                }
+            }
+            
+            if let Some(extension) = path.extension() {
+                let ext = extension.to_string_lossy().to_lowercase();
+                if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
+                    println!("Adding: {}", path.display());
+                    self.files_in_folder.push(path.to_path_buf());
                 }
             }
         }
+        
+        println!("Found {} images", self.files_in_folder.len());
         
         // Use natural sorting instead of lexicographical sorting
         self.files_in_folder.sort_by(|a, b| natural_sort_paths(a, b));
@@ -537,16 +566,6 @@ impl MangaReader {
 
 impl App for MangaReader {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        // Check if we need to open a file from command line on first update
-        if let Some(path) = self.current_path.clone() {
-            // Only try to open the file if we haven't loaded an image yet
-            if self.current_image.is_none() {
-                if let Err(e) = self.open_file(&path, ctx) {
-                    self.set_status(format!("Error opening file: {}", e), 5.0);
-                }
-            }
-        }
-        
         // Handle keyboard input first
         self.handle_keyboard_input(ctx);
         
