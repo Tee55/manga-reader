@@ -34,49 +34,78 @@ struct MangaReader {
 
 // Implement natural sorting for filenames
 fn natural_sort_paths(a: &Path, b: &Path) -> Ordering {
-    let a_name = a.file_name().unwrap_or_else(|| OsStr::new("")).to_string_lossy();
-    let b_name = b.file_name().unwrap_or_else(|| OsStr::new("")).to_string_lossy();
-    
+    let a_name = a
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(""))
+        .to_string_lossy();
+    let b_name = b
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(""))
+        .to_string_lossy();
+
     natural_sort(a_name.as_ref(), b_name.as_ref())
 }
 
 fn natural_sort(a: &str, b: &str) -> Ordering {
-    let mut a_parts = a.split(|c: char| !c.is_numeric());
-    let mut b_parts = b.split(|c: char| !c.is_numeric());
-    
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+
     loop {
-        match (a_parts.next(), b_parts.next()) {
-            (Some(a_part), Some(b_part)) => {
-                let a_trimmed = a_part.trim();
-                let b_trimmed = b_part.trim();
-                
-                if a_trimmed != b_trimmed {
-                    return a_trimmed.cmp(b_trimmed);
-                }
-            }
+        match (a_chars.peek(), b_chars.peek()) {
+            (None, None) => return Ordering::Equal,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (None, None) => break,
-        }
-        
-        let a_digits: String = a.chars().skip_while(|c| !c.is_numeric())
-                                   .take_while(|c| c.is_numeric())
-                                   .collect();
-        let b_digits: String = b.chars().skip_while(|c| !c.is_numeric())
-                                   .take_while(|c| c.is_numeric())
-                                   .collect();
-        
-        if !a_digits.is_empty() && !b_digits.is_empty() {
-            let a_num = a_digits.parse::<u64>().unwrap_or(0);
-            let b_num = b_digits.parse::<u64>().unwrap_or(0);
-            
-            if a_num != b_num {
-                return a_num.cmp(&b_num);
+            (Some(a_char), Some(b_char)) => {
+                if a_char.is_ascii_digit() && b_char.is_ascii_digit() {
+                    // Both are digits, compare as numbers
+                    let mut a_num_str = String::new();
+                    let mut b_num_str = String::new();
+
+                    // Extract the full number from a
+                    while let Some(&ch) = a_chars.peek() {
+                        if ch.is_ascii_digit() {
+                            a_num_str.push(ch);
+                            a_chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Extract the full number from b
+                    while let Some(&ch) = b_chars.peek() {
+                        if ch.is_ascii_digit() {
+                            b_num_str.push(ch);
+                            b_chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Parse and compare as numbers
+                    let a_num: u64 = a_num_str.parse().unwrap_or(0);
+                    let b_num: u64 = b_num_str.parse().unwrap_or(0);
+
+                    match a_num.cmp(&b_num) {
+                        Ordering::Equal => continue, // Numbers are equal, continue comparing
+                        other => return other,
+                    }
+                } else {
+                    // Compare as characters
+                    let a_ch = a_chars.next().unwrap();
+                    let b_ch = b_chars.next().unwrap();
+
+                    // Case-insensitive comparison
+                    let a_lower = a_ch.to_lowercase().to_string();
+                    let b_lower = b_ch.to_lowercase().to_string();
+
+                    match a_lower.cmp(&b_lower) {
+                        Ordering::Equal => continue, // Characters are equal, continue comparing
+                        other => return other,
+                    }
+                }
             }
         }
     }
-    
-    a.cmp(b)
 }
 
 impl Default for MangaReader {
@@ -566,6 +595,15 @@ impl MangaReader {
 
 impl App for MangaReader {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // Check if we need to open a file from command line on first update
+        if let Some(path) = self.current_path.clone() {
+            if self.current_image.is_none() {
+                if let Err(e) = self.open_file(&path, ctx) {
+                    self.set_status(format!("Error opening file: {}", e), 5.0);
+                }
+            }
+        }
+        
         // Handle keyboard input first
         self.handle_keyboard_input(ctx);
         
