@@ -973,22 +973,3 @@ fn main() -> Result<()> {
         Box::new(|cc| Ok(Box::new(MangaReader::new(cc)))),
     ).map_err(|e| anyhow::anyhow!("Failed to start application: {}", e))
 }
-
-fn main() -> Result<()> {
-    env_logger::init();
-    
-    let native_options = NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1920.0, 1080.0])
-            .with_title("Manga Reader")
-            .with_maximized(true)
-            .with_icon(load_icon()),
-        ..Default::default()
-    };
-    
-    run_native(
-        "Manga Reader",
-        native_options,
-        Box::new(|cc| Ok(Box::new(MangaReader::new(cc)))),
-    ).map_err(|e| anyhow::anyhow!("Failed to start application: {}", e))
-}
