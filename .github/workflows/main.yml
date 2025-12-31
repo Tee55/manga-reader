@@ -35,28 +35,24 @@ jobs:
     name: Build Windows binary
     needs: create-release
     if: needs.create-release.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
-
-      - name: Install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
 
       - name: Build for Windows
-        run: cargo build --release --target x86_64-pc-windows-gnu
+        run: cargo build --release
 
       - name: Create release archive
+        shell: pwsh
         run: |
-          mkdir release-files
-          cp target/x86_64-pc-windows-gnu/release/*.exe release-files/ 2>/dev/null || true
-          cp README.md LICENSE release-files/ 2>/dev/null || true
-          cd release-files
-          zip -r ../release.zip .
+          New-Item -ItemType Directory -Force -Path release-files
+          Copy-Item target/release/*.exe release-files/ -ErrorAction SilentlyContinue
+          Copy-Item README.md release-files/ -ErrorAction SilentlyContinue
+          Copy-Item LICENSE release-files/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path release-files/* -DestinationPath release.zip
 
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
@@ -65,5 +61,5 @@ jobs:
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
           asset_path: ./release.zip
-          asset_name: ${{ github.event.repository.name }}-${{ needs.create-release.outputs.tag_name }}-x86_64-pc-windows-gnu.zip
+          asset_name: ${{ github.event.repository.name }}-${{ needs.create-release.outputs.tag_name }}-x86_64-pc-windows-msvc.zip
           asset_content_type: application/zip
