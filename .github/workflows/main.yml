@@ -39,10 +39,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile and upload
-        uses: rust-build/rust-build.action@v1.4.5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Build for Windows
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Create release archive
+        run: |
+          mkdir release-files
+          cp target/x86_64-pc-windows-gnu/release/*.exe release-files/ 2>/dev/null || true
+          cp README.md LICENSE release-files/ 2>/dev/null || true
+          cd release-files
+          zip -r ../release.zip .
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          RUSTTARGET: x86_64-pc-windows-gnu
-          UPLOAD_MODE: release
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./release.zip
+          asset_name: ${{ github.event.repository.name }}-${{ needs.create-release.outputs.tag_name }}-x86_64-pc-windows-gnu.zip
+          asset_content_type: application/zip
