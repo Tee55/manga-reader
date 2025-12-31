@@ -930,19 +930,48 @@ impl MangaReader {
     }
 }
 
-fn load_icon() -> IconData {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/icon.png");
-    let image = image::open(path)
-        .expect("Failed to open icon path")
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    let rgba = image.into_raw();
+fn load_icon() -> Option<IconData> {
+    // Embed the icon at compile time
+    let icon_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/icon.png"));
     
-    IconData {
-        rgba,
-        width,
-        height,
+    match image::load_from_memory(icon_bytes) {
+        Ok(image) => {
+            let image = image.into_rgba8();
+            let (width, height) = image.dimensions();
+            let rgba = image.into_raw();
+            
+            Some(IconData { rgba, width, height })
+        }
+        Err(e) => {
+            eprintln!("Failed to load icon: {}", e);
+            None
+        }
     }
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1920.0, 1080.0])
+        .with_title("Manga Reader")
+        .with_maximized(true);
+    
+    // Add icon if available
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    
+    let native_options = NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    
+    run_native(
+        "Manga Reader",
+        native_options,
+        Box::new(|cc| Ok(Box::new(MangaReader::new(cc)))),
+    ).map_err(|e| anyhow::anyhow!("Failed to start application: {}", e))
 }
 
 fn main() -> Result<()> {
