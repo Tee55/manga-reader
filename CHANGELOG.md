@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/Tee55/manga-reader/compare/v0.1.5...v0.1.6) (2026-01-04)
+
+
+### Bug Fixes
+
+* thumbnail ([898d0ec](https://github.com/Tee55/manga-reader/commit/898d0ece4ee054eaa0b0787fe3e76db0a0cd4822))
+
 ## [0.1.5](https://github.com/Tee55/manga-reader/compare/v0.1.4...v0.1.5) (2026-01-03)
 
 
