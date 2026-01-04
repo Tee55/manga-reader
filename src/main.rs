@@ -11,6 +11,7 @@ use zip::ZipArchive;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::os::windows::fs::MetadataExt;
+use std::collections::HashMap;
 
 struct MangaReader {
     current_image: Option<TextureHandle>,
@@ -32,6 +33,10 @@ struct MangaReader {
     is_in_archive: bool,
     show_delete_confirmation: bool,
     pending_delete_path: Option<PathBuf>,
+    // Thumbnail support
+    thumbnail_cache: HashMap<PathBuf, TextureHandle>,
+    thumbnail_size: usize,
+    show_thumbnail_panel: bool,
 }
 
 // Implement natural sorting for filenames
@@ -126,6 +131,9 @@ impl Default for MangaReader {
             is_in_archive: false,
             show_delete_confirmation: false,
             pending_delete_path: None,
+            thumbnail_cache: HashMap::new(),
+            thumbnail_size: 200,
+            show_thumbnail_panel: false,
         }
     }
 }
@@ -176,6 +184,115 @@ impl MangaReader {
         self.archive_files.sort_by(|a, b| natural_sort_paths(a, b));
         
         Ok(())
+    }
+
+    fn generate_thumbnail(&self, path: &Path) -> Result<DynamicImage> {
+        if Self::is_archive_file(path) {
+            self.generate_archive_thumbnail(path)
+        } else {
+            self.generate_image_thumbnail(path)
+        }
+    }
+
+    fn generate_image_thumbnail(&self, path: &Path) -> Result<DynamicImage> {
+        let img = image::ImageReader::open(path)
+            .with_context(|| format!("Failed to open image: {}", path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("Failed to determine format: {}", path.display()))?
+            .decode()
+            .with_context(|| format!("Failed to decode image: {}", path.display()))?;
+        
+        let thumbnail = img.thumbnail(self.thumbnail_size as u32, self.thumbnail_size as u32);
+        Ok(thumbnail)
+    }
+
+    fn generate_archive_thumbnail(&self, path: &Path) -> Result<DynamicImage> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let mut archive = ZipArchive::new(reader)?;
+        
+        let mut image_files = Vec::new();
+        for i in 0..archive.len() {
+            let file = archive.by_index(i)?;
+            let name = file.name().to_owned();
+            
+            if let Some(extension) = Path::new(&name).extension() {
+                let ext = extension.to_string_lossy().to_lowercase();
+                if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
+                    image_files.push((i, name));
+                }
+            }
+        }
+        
+        image_files.sort_by(|a, b| natural_sort(&a.1, &b.1));
+        
+        if image_files.is_empty() {
+            return Err(anyhow::anyhow!("No images found in archive"));
+        }
+        
+        // Get the first image
+        let (first_idx, first_name) = &image_files[0];
+        let mut file = archive.by_index(*first_idx)?;
+        
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        
+        let format = match Path::new(first_name).extension().and_then(|ext| ext.to_str()) {
+            Some("jpg") | Some("jpeg") => ImageFormat::Jpeg,
+            Some("png") => ImageFormat::Png,
+            Some("webp") => ImageFormat::WebP,
+            Some("gif") => ImageFormat::Gif,
+            _ => return Err(anyhow::anyhow!("Unsupported image format")),
+        };
+        
+        let img = image::load_from_memory_with_format(&buffer, format)?;
+        let thumbnail = img.thumbnail(self.thumbnail_size as u32, self.thumbnail_size as u32);
+        Ok(thumbnail)
+    }
+
+    fn load_thumbnail(&mut self, path: &Path, ctx: &egui::Context) {
+        if self.thumbnail_cache.contains_key(path) {
+            return;
+        }
+        
+        if let Ok(thumbnail) = self.generate_thumbnail(path) {
+            let size = [thumbnail.width() as _, thumbnail.height() as _];
+            let image_buffer = thumbnail.to_rgba8();
+            let pixels = image_buffer.as_flat_samples();
+            let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+            
+            let texture = ctx.load_texture(
+                format!("thumb_{}", path.display()),
+                color_image,
+                TextureOptions::default(),
+            );
+            
+            self.thumbnail_cache.insert(path.to_path_buf(), texture);
+        }
+    }
+
+    fn load_visible_thumbnails(&mut self, ctx: &egui::Context) {
+        // Load thumbnails for current and nearby files
+        let start_idx = self.current_index.saturating_sub(5);
+        let end_idx = (self.current_index + 10).min(self.files_in_folder.len());
+        
+        for i in start_idx..end_idx {
+            if let Some(path) = self.files_in_folder.get(i) {
+                self.load_thumbnail(path, ctx);
+            }
+        }
+        
+        // Also load archive thumbnails if we have them
+        if !self.is_in_archive {
+            let start_archive = self.current_archive_index.saturating_sub(3);
+            let end_archive = (self.current_archive_index + 6).min(self.archive_files.len());
+            
+            for i in start_archive..end_archive {
+                if let Some(path) = self.archive_files.get(i) {
+                    self.load_thumbnail(path, ctx);
+                }
+            }
+        }
     }
 
     fn open_file(&mut self, path: &Path, ctx: &egui::Context) -> Result<()> {
@@ -399,7 +516,6 @@ impl MangaReader {
     }
 
     fn delete_current_file(&mut self, ctx: &egui::Context) -> Result<()> {
-        // Cannot delete files inside archives
         if self.is_in_archive {
             self.set_status("Cannot delete files inside archives".to_string(), 3.0);
             return Ok(());
@@ -411,16 +527,13 @@ impl MangaReader {
         
         let file_to_delete = self.files_in_folder[self.current_index].clone();
         
-        // Delete the file from the filesystem
         fs::remove_file(&file_to_delete)
             .with_context(|| format!("Failed to delete file: {}", file_to_delete.display()))?;
         
         self.set_status(format!("Deleted: {}", file_to_delete.file_name().unwrap_or_default().to_string_lossy()), 3.0);
         
-        // Remove from the list
         self.files_in_folder.remove(self.current_index);
         
-        // Load the next image or previous if at the end
         if !self.files_in_folder.is_empty() {
             if self.current_index >= self.files_in_folder.len() {
                 self.current_index = self.files_in_folder.len() - 1;
@@ -429,7 +542,6 @@ impl MangaReader {
             let next_file = self.files_in_folder[self.current_index].clone();
             self.load_image(&next_file, ctx)?;
         } else {
-            // No more images
             self.current_image = None;
             self.set_status("No more images in directory".to_string(), 3.0);
         }
@@ -513,10 +625,11 @@ impl MangaReader {
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Delete),
+                i.key_pressed(egui::Key::T),
             )
         });
         
-        let (left, right, ctrl_plus, ctrl_minus, f_key, f11_key, home_key, end_key, escape_key, space_key, delete_key) = input;
+        let (left, right, ctrl_plus, ctrl_minus, f_key, f11_key, home_key, end_key, escape_key, space_key, delete_key, t_key) = input;
         
         if left {
             let _ = self.previous_image(ctx);
@@ -541,8 +654,11 @@ impl MangaReader {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
         
+        if t_key {
+            self.show_thumbnail_panel = !self.show_thumbnail_panel;
+        }
+        
         if delete_key && !self.files_in_folder.is_empty() {
-            // Show confirmation dialog
             self.show_delete_confirmation = true;
             self.pending_delete_path = Some(self.files_in_folder[self.current_index].clone());
         }
@@ -579,9 +695,13 @@ impl MangaReader {
             }
         }
         
-        if escape_key && self.fullscreen {
-            self.fullscreen = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        if escape_key {
+            if self.fullscreen {
+                self.fullscreen = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            } else if self.show_thumbnail_panel {
+                self.show_thumbnail_panel = false;
+            }
         }
     }
 }
@@ -598,6 +718,10 @@ impl App for MangaReader {
         
         self.handle_keyboard_input(ctx);
         
+        if self.show_thumbnail_panel {
+            self.load_visible_thumbnails(ctx);
+        }
+        
         if let Some((_, ref mut duration)) = self.status_message {
             *duration -= ctx.input(|i| i.unstable_dt);
             if *duration <= 0.0 {
@@ -605,7 +729,6 @@ impl App for MangaReader {
             }
         }
 
-        // Show delete confirmation dialog
         if self.show_delete_confirmation {
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
@@ -638,6 +761,7 @@ impl App for MangaReader {
                     });
                 });
         }
+        // CONTINUATION FROM: if self.show_delete_confirmation { ... }
 
         if self.show_last_image_alert {
             egui::Window::new("Last Image")
@@ -731,6 +855,13 @@ impl App for MangaReader {
                         self.fullscreen = !self.fullscreen;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                     }
+                    
+                    ui.separator();
+                    
+                    let thumbnail_text = if self.show_thumbnail_panel { "Hide Thumbnails (T)" } else { "Show Thumbnails (T)" };
+                    if ui.button(thumbnail_text).clicked() {
+                        self.show_thumbnail_panel = !self.show_thumbnail_panel;
+                    }
                 });
             });
 
@@ -760,6 +891,105 @@ impl App for MangaReader {
                         }
                     });
                 });
+                
+                if self.show_thumbnail_panel {
+                    egui::SidePanel::right("thumbnail_panel")
+                        .default_width(250.0)
+                        .show_inside(ui, |ui| {
+                            ui.heading("Thumbnails");
+                            ui.separator();
+                            
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                if self.is_in_archive {
+                                    ui.label("Archive Contents");
+                                    ui.add_space(5.0);
+                                }
+                                
+                                for (idx, file_path) in self.files_in_folder.iter().enumerate() {
+                                    let is_current = idx == self.current_index;
+                                    
+                                    let frame = egui::Frame::default()
+                                        .fill(if is_current { Color32::from_rgb(50, 50, 80) } else { Color32::TRANSPARENT })
+                                        .corner_radius(5.0)
+                                        .inner_margin(5.0);
+                                    
+                                    frame.show(ui, |ui| {
+                                        ui.vertical(|ui| {
+                                            let thumb_size = egui::vec2(200.0, 200.0);
+                                            
+                                            if let Some(texture) = self.thumbnail_cache.get(file_path) {
+                                                let response = ui.add(
+                                                    egui::Image::new(texture)
+                                                        .fit_to_exact_size(thumb_size)
+                                                        .sense(Sense::click())
+                                                );
+                                                
+                                                if response.clicked() {
+                                                    self.current_index = idx;
+                                                    if let Some(current_path) = &self.current_path {
+                                                        let current_path_clone = current_path.clone();
+                                                        if self.is_in_archive {
+                                                            let _ = self.load_cbz_image(&current_path_clone, file_path, ctx);
+                                                        } else {
+                                                            let _ = self.load_image(file_path, ctx);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                ui.allocate_space(thumb_size);
+                                                ui.label("Loading...");
+                                            }
+                                            
+                                            ui.label(format!("{}", idx + 1));
+                                            ui.label(file_path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                                        });
+                                    });
+                                    
+                                    ui.add_space(5.0);
+                                }
+                                
+                                if !self.is_in_archive && !self.archive_files.is_empty() {
+                                    ui.separator();
+                                    ui.heading("Archives in Directory");
+                                    ui.add_space(5.0);
+                                    
+                                    for (idx, archive_path) in self.archive_files.iter().enumerate() {
+                                        let is_current = idx == self.current_archive_index;
+                                        
+                                        let frame = egui::Frame::default()
+                                            .fill(if is_current { Color32::from_rgb(50, 50, 80) } else { Color32::TRANSPARENT })
+                                            .corner_radius(5.0)
+                                            .inner_margin(5.0);
+                                        
+                                        frame.show(ui, |ui| {
+                                            ui.vertical(|ui| {
+                                                let thumb_size = egui::vec2(200.0, 200.0);
+                                                
+                                                if let Some(texture) = self.thumbnail_cache.get(archive_path) {
+                                                    let response = ui.add(
+                                                        egui::Image::new(texture)
+                                                            .fit_to_exact_size(thumb_size)
+                                                            .sense(Sense::click())
+                                                    );
+                                                    
+                                                    if response.clicked() {
+                                                        let _ = self.open_file(archive_path, ctx);
+                                                    }
+                                                } else {
+                                                    ui.allocate_space(thumb_size);
+                                                    ui.label("Loading...");
+                                                }
+                                                
+                                                ui.label(archive_path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                                            });
+                                        });
+                                        
+                                        ui.add_space(5.0);
+                                    }
+                                }
+                            });
+                        });
+                }
                 
                 self.draw_image_view(ui, ctx);
             });
@@ -917,10 +1147,11 @@ impl MangaReader {
                         ui.label("Ctrl+Plus/Minus: Zoom in/out");
                         ui.label("F: Fit image to view");
                         ui.label("F11: Toggle fullscreen");
+                        ui.label("T: Toggle thumbnail panel");
                         ui.label("Home/End: First/Last image");
                         ui.label("Space: Next image");
                         ui.label("Delete: Delete current image");
-                        ui.label("Escape: Exit fullscreen");
+                        ui.label("Escape: Exit fullscreen/Close panels");
                         ui.label("Mouse drag: Pan image");
                         ui.label("Mouse wheel: Navigate images");
                         ui.label("Ctrl+Mouse wheel: Zoom in/out");
