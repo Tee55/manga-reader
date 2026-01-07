@@ -1,20 +1,20 @@
 use anyhow::{Context as AnyhowContext, Result};
-use eframe::{egui, run_native, App, CreationContext, Frame, NativeOptions};
-use egui::{Color32, ColorImage, IconData, Rect, Sense, TextureHandle, TextureOptions, Ui};
+use eframe::{egui, App, CreationContext, Frame, NativeOptions, run_native};
+use egui::{Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions, Ui, IconData};
 use image::{DynamicImage, ImageFormat};
-use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::env;
-use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use zip::ZipArchive;
+use std::cmp::Ordering;
+use std::ffi::OsStr;
+use std::os::windows::fs::MetadataExt;
 
 struct MangaReader {
     current_image: Option<TextureHandle>,
+    current_image_data: Option<DynamicImage>, // Store the actual image data
     current_path: Option<PathBuf>,
     files_in_folder: Vec<PathBuf>,
     current_index: usize,
@@ -33,10 +33,6 @@ struct MangaReader {
     is_in_archive: bool,
     show_delete_confirmation: bool,
     pending_delete_path: Option<PathBuf>,
-    // Thumbnail support
-    thumbnail_cache: HashMap<PathBuf, TextureHandle>,
-    thumbnail_size: usize,
-    show_thumbnail_panel: bool,
 }
 
 // Implement natural sorting for filenames
@@ -49,7 +45,6 @@ fn natural_sort_paths(a: &Path, b: &Path) -> Ordering {
         .file_name()
         .unwrap_or_else(|| OsStr::new(""))
         .to_string_lossy();
-
     natural_sort(a_name.as_ref(), b_name.as_ref())
 }
 
@@ -95,10 +90,8 @@ fn natural_sort(a: &str, b: &str) -> Ordering {
                 } else {
                     let a_ch = a_chars.next().unwrap();
                     let b_ch = b_chars.next().unwrap();
-
                     let a_lower = a_ch.to_lowercase().to_string();
                     let b_lower = b_ch.to_lowercase().to_string();
-
                     match a_lower.cmp(&b_lower) {
                         Ordering::Equal => continue,
                         other => return other,
@@ -113,6 +106,7 @@ impl Default for MangaReader {
     fn default() -> Self {
         Self {
             current_image: None,
+            current_image_data: None,
             current_path: None,
             files_in_folder: Vec::new(),
             current_index: 0,
@@ -131,9 +125,6 @@ impl Default for MangaReader {
             is_in_archive: false,
             show_delete_confirmation: false,
             pending_delete_path: None,
-            thumbnail_cache: HashMap::new(),
-            thumbnail_size: 200,
-            show_thumbnail_panel: false,
         }
     }
 }
@@ -148,9 +139,7 @@ impl MangaReader {
             if file_path.exists() {
                 let _ctx = cc.egui_ctx.clone();
                 let _file_path_clone = file_path.clone();
-
                 cc.egui_ctx.request_repaint();
-
                 reader.current_path = Some(file_path);
             }
         }
@@ -173,138 +162,18 @@ impl MangaReader {
 
     fn list_archive_files_in_directory(&mut self, dir: &Path) -> Result<()> {
         self.archive_files.clear();
-
-        for entry in WalkDir::new(dir)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_file() && Self::is_archive_file(path) {
                 self.archive_files.push(path.to_path_buf());
             }
         }
-
         self.archive_files.sort_by(|a, b| natural_sort_paths(a, b));
-
         Ok(())
-    }
-
-    fn generate_thumbnail(&self, path: &Path) -> Result<DynamicImage> {
-        if Self::is_archive_file(path) {
-            self.generate_archive_thumbnail(path)
-        } else {
-            self.generate_image_thumbnail(path)
-        }
-    }
-
-    fn generate_image_thumbnail(&self, path: &Path) -> Result<DynamicImage> {
-        let img = image::ImageReader::open(path)
-            .with_context(|| format!("Failed to open image: {}", path.display()))?
-            .with_guessed_format()
-            .with_context(|| format!("Failed to determine format: {}", path.display()))?
-            .decode()
-            .with_context(|| format!("Failed to decode image: {}", path.display()))?;
-
-        let thumbnail = img.thumbnail(self.thumbnail_size as u32, self.thumbnail_size as u32);
-        Ok(thumbnail)
-    }
-
-    fn generate_archive_thumbnail(&self, path: &Path) -> Result<DynamicImage> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut archive = ZipArchive::new(reader)?;
-
-        let mut image_files = Vec::new();
-        for i in 0..archive.len() {
-            let file = archive.by_index(i)?;
-            let name = file.name().to_owned();
-
-            if let Some(extension) = Path::new(&name).extension() {
-                let ext = extension.to_string_lossy().to_lowercase();
-                if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
-                    image_files.push((i, name));
-                }
-            }
-        }
-
-        image_files.sort_by(|a, b| natural_sort(&a.1, &b.1));
-
-        if image_files.is_empty() {
-            return Err(anyhow::anyhow!("No images found in archive"));
-        }
-
-        // Get the first image
-        let (first_idx, first_name) = &image_files[0];
-        let mut file = archive.by_index(*first_idx)?;
-
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-
-        let format = match Path::new(first_name)
-            .extension()
-            .and_then(|ext| ext.to_str())
-        {
-            Some("jpg") | Some("jpeg") => ImageFormat::Jpeg,
-            Some("png") => ImageFormat::Png,
-            Some("webp") => ImageFormat::WebP,
-            Some("gif") => ImageFormat::Gif,
-            _ => return Err(anyhow::anyhow!("Unsupported image format")),
-        };
-
-        let img = image::load_from_memory_with_format(&buffer, format)?;
-        let thumbnail = img.thumbnail(self.thumbnail_size as u32, self.thumbnail_size as u32);
-        Ok(thumbnail)
-    }
-
-    fn load_thumbnail(&mut self, path: &Path, ctx: &egui::Context) {
-        if self.thumbnail_cache.contains_key(path) {
-            return;
-        }
-
-        if let Ok(thumbnail) = self.generate_thumbnail(path) {
-            let size = [thumbnail.width() as _, thumbnail.height() as _];
-            let image_buffer = thumbnail.to_rgba8();
-            let pixels = image_buffer.as_flat_samples();
-            let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-
-            let texture = ctx.load_texture(
-                format!("thumb_{}", path.display()),
-                color_image,
-                TextureOptions::default(),
-            );
-
-            self.thumbnail_cache.insert(path.to_path_buf(), texture);
-        }
-    }
-
-    fn load_visible_thumbnails(&mut self, ctx: &egui::Context) {
-        // Load thumbnails for current and nearby files
-        let start_idx = self.current_index.saturating_sub(5);
-        let end_idx = (self.current_index + 10).min(self.files_in_folder.len());
-
-        // Clone paths to avoid borrow conflicts
-        let paths_to_load: Vec<PathBuf> = self.files_in_folder[start_idx..end_idx].to_vec();
-        for path in paths_to_load {
-            self.load_thumbnail(&path, ctx);
-        }
-
-        // Also load archive thumbnails if we have them
-        if !self.is_in_archive {
-            let start_archive = self.current_archive_index.saturating_sub(3);
-            let end_archive = (self.current_archive_index + 6).min(self.archive_files.len());
-
-            let archive_paths: Vec<PathBuf> =
-                self.archive_files[start_archive..end_archive].to_vec();
-            for path in archive_paths {
-                self.load_thumbnail(&path, ctx);
-            }
-        }
     }
 
     fn open_file(&mut self, path: &Path, ctx: &egui::Context) -> Result<()> {
         self.current_path = Some(path.to_path_buf());
-
         self.zoom = 1.0;
         self.offset_x = 0.0;
         self.offset_y = 0.0;
@@ -316,18 +185,11 @@ impl MangaReader {
             if !self.files_in_folder.is_empty() {
                 let first_file = self.files_in_folder[0].clone();
                 self.current_index = 0;
-                self.load_image(&first_file, ctx).with_context(|| {
-                    format!(
-                        "Failed to load first image in directory: {}",
-                        first_file.display()
-                    )
-                })?;
+                self.load_image(&first_file, ctx)
+                    .with_context(|| format!("Failed to load first image in directory: {}", first_file.display()))?;
                 self.set_status(format!("Opened directory: {}", path.display()), 3.0);
             } else {
-                self.set_status(
-                    format!("No images found in directory: {}", path.display()),
-                    3.0,
-                );
+                self.set_status(format!("No images found in directory: {}", path.display()), 3.0);
             }
             return Ok(());
         }
@@ -336,13 +198,11 @@ impl MangaReader {
             self.is_in_archive = true;
             if let Some(parent) = path.parent() {
                 self.list_archive_files_in_directory(parent)?;
-                self.current_archive_index = self
-                    .archive_files
+                self.current_archive_index = self.archive_files
                     .iter()
                     .position(|p| p == path)
                     .unwrap_or(0);
             }
-
             self.load_cbz(path, ctx)
                 .with_context(|| format!("Failed to load archive: {}", path.display()))?;
             self.set_status(format!("Opened archive: {}", path.display()), 3.0);
@@ -356,8 +216,7 @@ impl MangaReader {
 
         if let Some(parent) = path.parent() {
             self.list_image_files_in_directory(parent)?;
-            self.current_index = self
-                .files_in_folder
+            self.current_index = self.files_in_folder
                 .iter()
                 .position(|p| p == path)
                 .unwrap_or(0);
@@ -368,7 +227,6 @@ impl MangaReader {
 
     fn list_image_files_in_directory(&mut self, dir: &Path) -> Result<()> {
         self.files_in_folder.clear();
-
         println!("Scanning directory: {}", dir.display());
 
         for entry in WalkDir::new(dir)
@@ -377,7 +235,6 @@ impl MangaReader {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-
             if !path.is_file() {
                 continue;
             }
@@ -385,12 +242,8 @@ impl MangaReader {
             if let Ok(metadata) = path.metadata() {
                 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
                 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-
                 let attributes = metadata.file_attributes();
-
-                if (attributes & FILE_ATTRIBUTE_HIDDEN) != 0
-                    || (attributes & FILE_ATTRIBUTE_SYSTEM) != 0
-                {
+                if (attributes & FILE_ATTRIBUTE_HIDDEN) != 0 || (attributes & FILE_ATTRIBUTE_SYSTEM) != 0 {
                     println!("Skipping hidden/system file: {}", path.display());
                     continue;
                 }
@@ -406,10 +259,7 @@ impl MangaReader {
         }
 
         println!("Found {} images", self.files_in_folder.len());
-
-        self.files_in_folder
-            .sort_by(|a, b| natural_sort_paths(a, b));
-
+        self.files_in_folder.sort_by(|a, b| natural_sort_paths(a, b));
         Ok(())
     }
 
@@ -434,7 +284,6 @@ impl MangaReader {
         for i in 0..archive.len() {
             let file = archive.by_index(i)?;
             let name = file.name().to_owned();
-
             if let Some(extension) = Path::new(&name).extension() {
                 let ext = extension.to_string_lossy().to_lowercase();
                 if ["jpg", "jpeg", "png", "webp", "gif"].contains(&ext.as_str()) {
@@ -453,10 +302,7 @@ impl MangaReader {
             let first_image = self.files_in_folder[0].clone();
             self.current_index = 0;
             self.load_cbz_image(path, &first_image, ctx)?;
-            self.set_status(
-                format!("Loaded archive with {} images", self.files_in_folder.len()),
-                3.0,
-            );
+            self.set_status(format!("Loaded archive with {} images", self.files_in_folder.len()), 3.0);
         } else {
             self.set_status("No images found in archive".to_string(), 3.0);
         }
@@ -464,19 +310,13 @@ impl MangaReader {
         Ok(())
     }
 
-    fn load_cbz_image(
-        &mut self,
-        cbz_path: &Path,
-        image_path: &Path,
-        ctx: &egui::Context,
-    ) -> Result<()> {
+    fn load_cbz_image(&mut self, cbz_path: &Path, image_path: &Path, ctx: &egui::Context) -> Result<()> {
         let file = File::open(cbz_path)?;
         let reader = BufReader::new(file);
         let mut archive = ZipArchive::new(reader)?;
 
         let image_name = image_path.to_string_lossy();
         let mut file = archive.by_name(&image_name)?;
-
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
@@ -490,7 +330,6 @@ impl MangaReader {
 
         let img = image::load_from_memory_with_format(&buffer, format)?;
         self.set_image(img, ctx);
-
         Ok(())
     }
 
@@ -500,8 +339,14 @@ impl MangaReader {
         let pixels = image_buffer.as_flat_samples();
         let color_image = ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
 
-        self.current_image =
-            Some(ctx.load_texture("current_image", color_image, TextureOptions::default()));
+        self.current_image = Some(ctx.load_texture(
+            "current_image",
+            color_image,
+            TextureOptions::default(),
+        ));
+        
+        // Store the image data for saving
+        self.current_image_data = Some(img);
 
         if self.auto_fit {
             self.fit_to_view(ctx);
@@ -512,8 +357,10 @@ impl MangaReader {
         if let Some(image) = &self.current_image {
             let image_size = image.size_vec2();
             let screen_size = ctx.available_rect().size();
+
             let width_ratio = screen_size.x / image_size.x;
             let height_ratio = screen_size.y / image_size.y;
+
             self.zoom = width_ratio.min(height_ratio) * 0.9;
             self.offset_x = 0.0;
             self.offset_y = 0.0;
@@ -531,16 +378,7 @@ impl MangaReader {
             self.current_archive_index = next_index;
             self.current_path = Some(next_archive.clone());
             self.load_cbz(&next_archive, ctx)?;
-            self.set_status(
-                format!(
-                    "Loaded next archive: {}",
-                    next_archive
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                ),
-                3.0,
-            );
+            self.set_status(format!("Loaded next archive: {}", next_archive.file_name().unwrap_or_default().to_string_lossy()), 3.0);
             Ok(true)
         } else {
             self.set_status("No more archives to load".to_string(), 3.0);
@@ -549,6 +387,7 @@ impl MangaReader {
     }
 
     fn delete_current_file(&mut self, ctx: &egui::Context) -> Result<()> {
+        // Cannot delete files inside archives
         if self.is_in_archive {
             self.set_status("Cannot delete files inside archives".to_string(), 3.0);
             return Ok(());
@@ -560,34 +399,83 @@ impl MangaReader {
 
         let file_to_delete = self.files_in_folder[self.current_index].clone();
 
+        // Delete the file from the filesystem
         fs::remove_file(&file_to_delete)
             .with_context(|| format!("Failed to delete file: {}", file_to_delete.display()))?;
 
-        self.set_status(
-            format!(
-                "Deleted: {}",
-                file_to_delete
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ),
-            3.0,
-        );
+        self.set_status(format!("Deleted: {}", file_to_delete.file_name().unwrap_or_default().to_string_lossy()), 3.0);
 
+        // Remove from the list
         self.files_in_folder.remove(self.current_index);
 
+        // Load the next image or previous if at the end
         if !self.files_in_folder.is_empty() {
             if self.current_index >= self.files_in_folder.len() {
                 self.current_index = self.files_in_folder.len() - 1;
             }
-
             let next_file = self.files_in_folder[self.current_index].clone();
             self.load_image(&next_file, ctx)?;
         } else {
+            // No more images
             self.current_image = None;
+            self.current_image_data = None;
             self.set_status("No more images in directory".to_string(), 3.0);
         }
 
+        Ok(())
+    }
+
+    fn save_current_image(&self) -> Result<()> {
+        if let Some(img_data) = &self.current_image_data {
+            // Generate default filename
+            let default_filename = if self.is_in_archive {
+                // Format: archivename_imagename
+                if let (Some(archive_path), Some(image_path)) = (&self.current_path, self.files_in_folder.get(self.current_index)) {
+                    let archive_name = archive_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("archive");
+                    let image_name = image_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("image.png");
+                    format!("{}_{}", archive_name, image_name)
+                } else {
+                    "image.png".to_string()
+                }
+            } else {
+                // Use the current filename
+                self.files_in_folder
+                    .get(self.current_index)
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image.png")
+                    .to_string()
+            };
+
+            // Open save dialog
+            if let Some(save_path) = rfd::FileDialog::new()
+                .set_file_name(&default_filename)
+                .add_filter("PNG Image", &["png"])
+                .add_filter("JPEG Image", &["jpg", "jpeg"])
+                .add_filter("WebP Image", &["webp"])
+                .save_file()
+            {
+                // Determine format from extension
+                let format = match save_path.extension().and_then(|ext| ext.to_str()) {
+                    Some("jpg") | Some("jpeg") => ImageFormat::Jpeg,
+                    Some("png") => ImageFormat::Png,
+                    Some("webp") => ImageFormat::WebP,
+                    _ => ImageFormat::Png, // Default to PNG
+                };
+
+                // Save the image
+                img_data.save_with_format(&save_path, format)
+                    .with_context(|| format!("Failed to save image to: {}", save_path.display()))?;
+
+                return Ok(());
+            }
+        }
         Ok(())
     }
 
@@ -605,10 +493,7 @@ impl MangaReader {
                 return Ok(());
             } else {
                 self.show_last_image_alert = true;
-                self.set_status(
-                    "Reaching last image. Scroll again to load next archive.".to_string(),
-                    3.0,
-                );
+                self.set_status("Reaching last image. Scroll again to load next archive.".to_string(), 3.0);
                 return Ok(());
             }
         }
@@ -635,7 +520,6 @@ impl MangaReader {
         }
 
         self.show_last_image_alert = false;
-
         self.current_index = if self.current_index == 0 {
             self.files_in_folder.len() - 1
         } else {
@@ -670,24 +554,10 @@ impl MangaReader {
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Delete),
-                i.key_pressed(egui::Key::T),
             )
         });
 
-        let (
-            left,
-            right,
-            ctrl_plus,
-            ctrl_minus,
-            f_key,
-            f11_key,
-            home_key,
-            end_key,
-            escape_key,
-            space_key,
-            delete_key,
-            t_key,
-        ) = input;
+        let (left, right, ctrl_plus, ctrl_minus, f_key, f11_key, home_key, end_key, escape_key, space_key, delete_key) = input;
 
         if left {
             let _ = self.previous_image(ctx);
@@ -695,32 +565,24 @@ impl MangaReader {
         if right || space_key {
             let _ = self.next_image(ctx);
         }
-
         if ctrl_plus {
             self.zoom *= 1.2;
         }
         if ctrl_minus {
             self.zoom *= 0.8;
         }
-
         if f_key {
             self.fit_to_view(ctx);
         }
-
         if f11_key {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
-
-        if t_key {
-            self.show_thumbnail_panel = !self.show_thumbnail_panel;
-        }
-
         if delete_key && !self.files_in_folder.is_empty() {
+            // Show confirmation dialog
             self.show_delete_confirmation = true;
             self.pending_delete_path = Some(self.files_in_folder[self.current_index].clone());
         }
-
         if home_key && !self.files_in_folder.is_empty() {
             self.current_index = 0;
             let path = self.files_in_folder[self.current_index].clone();
@@ -736,7 +598,6 @@ impl MangaReader {
                 }
             }
         }
-
         if end_key && !self.files_in_folder.is_empty() {
             self.current_index = self.files_in_folder.len() - 1;
             let path = self.files_in_folder[self.current_index].clone();
@@ -752,14 +613,9 @@ impl MangaReader {
                 }
             }
         }
-
-        if escape_key {
-            if self.fullscreen {
-                self.fullscreen = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            } else if self.show_thumbnail_panel {
-                self.show_thumbnail_panel = false;
-            }
+        if escape_key && self.fullscreen {
+            self.fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
     }
 }
@@ -776,10 +632,6 @@ impl App for MangaReader {
 
         self.handle_keyboard_input(ctx);
 
-        if self.show_thumbnail_panel {
-            self.load_visible_thumbnails(ctx);
-        }
-
         if let Some((_, ref mut duration)) = self.status_message {
             *duration -= ctx.input(|i| i.unstable_dt);
             if *duration <= 0.0 {
@@ -787,6 +639,7 @@ impl App for MangaReader {
             }
         }
 
+        // Show delete confirmation dialog
         if self.show_delete_confirmation {
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
@@ -795,16 +648,11 @@ impl App for MangaReader {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label("Are you sure you want to delete this file?");
-
                         if let Some(path) = &self.pending_delete_path {
                             ui.add_space(10.0);
-                            ui.label(format!(
-                                "{}",
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ));
+                            ui.label(format!("{}", path.file_name().unwrap_or_default().to_string_lossy()));
                             ui.add_space(10.0);
                         }
-
                         ui.horizontal(|ui| {
                             if ui.button("Yes, Delete").clicked() {
                                 if let Err(e) = self.delete_current_file(ctx) {
@@ -813,7 +661,6 @@ impl App for MangaReader {
                                 self.show_delete_confirmation = false;
                                 self.pending_delete_path = None;
                             }
-
                             if ui.button("Cancel").clicked() {
                                 self.show_delete_confirmation = false;
                                 self.pending_delete_path = None;
@@ -822,7 +669,6 @@ impl App for MangaReader {
                     });
                 });
         }
-        // CONTINUATION FROM: if self.show_delete_confirmation { ... }
 
         if self.show_last_image_alert {
             egui::Window::new("Last Image")
@@ -833,26 +679,15 @@ impl App for MangaReader {
                     ui.vertical_centered(|ui| {
                         ui.label("You've reached the last image in this archive.");
                         ui.add_space(10.0);
-
                         if self.current_archive_index + 1 < self.archive_files.len() {
                             ui.label("Scroll again to load the next archive:");
-                            if let Some(next_archive) =
-                                self.archive_files.get(self.current_archive_index + 1)
-                            {
-                                ui.label(format!(
-                                    "{}",
-                                    next_archive
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                ));
+                            if let Some(next_archive) = self.archive_files.get(self.current_archive_index + 1) {
+                                ui.label(format!("{}", next_archive.file_name().unwrap_or_default().to_string_lossy()));
                             }
                         } else {
                             ui.label("No more archives available.");
                         }
-
                         ui.add_space(10.0);
-
                         if ui.button("OK").clicked() {
                             self.show_last_image_alert = false;
                         }
@@ -865,20 +700,9 @@ impl App for MangaReader {
                 ui.horizontal(|ui| {
                     if ui.button("Open File").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter(
-                                "Comics & Images",
-                                &["jpg", "jpeg", "png", "webp", "gif", "cbz", "zip"],
-                            )
+                            .add_filter("Comics & Images", &["jpg", "jpeg", "png", "webp", "gif", "cbz", "zip"])
                             .pick_file()
                         {
-                            if let Err(e) = self.open_file(&path, ctx) {
-                                self.set_status(format!("Error: {}", e), 5.0);
-                            }
-                        }
-                    }
-
-                    if ui.button("Open Directory").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             if let Err(e) = self.open_file(&path, ctx) {
                                 self.set_status(format!("Error: {}", e), 5.0);
                             }
@@ -892,7 +716,6 @@ impl App for MangaReader {
                             self.set_status(format!("Error: {}", e), 5.0);
                         }
                     }
-
                     if ui.button("Next (->)").clicked() {
                         if let Err(e) = self.next_image(ctx) {
                             self.set_status(format!("Error: {}", e), 5.0);
@@ -904,11 +727,9 @@ impl App for MangaReader {
                     if ui.button("Zoom In (+)").clicked() {
                         self.zoom *= 1.2;
                     }
-
                     if ui.button("Zoom Out (-)").clicked() {
                         self.zoom *= 0.8;
                     }
-
                     if ui.button("Fit to View (F)").clicked() {
                         self.fit_to_view(ctx);
                     }
@@ -927,20 +748,19 @@ impl App for MangaReader {
 
                     ui.separator();
 
-                    if ui.button("Fullscreen (F11)").clicked() {
-                        self.fullscreen = !self.fullscreen;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                    if ui.button("Save Image As...").clicked() {
+                        if let Err(e) = self.save_current_image() {
+                            self.set_status(format!("Error saving image: {}", e), 5.0);
+                        } else {
+                            self.set_status("Image saved successfully".to_string(), 3.0);
+                        }
                     }
 
                     ui.separator();
 
-                    let thumbnail_text = if self.show_thumbnail_panel {
-                        "Hide Thumbnails (T)"
-                    } else {
-                        "Show Thumbnails (T)"
-                    };
-                    if ui.button(thumbnail_text).clicked() {
-                        self.show_thumbnail_panel = !self.show_thumbnail_panel;
+                    if ui.button("Fullscreen (F11)").clicked() {
+                        self.fullscreen = !self.fullscreen;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                     }
                 });
             });
@@ -954,185 +774,27 @@ impl App for MangaReader {
                                 self.current_index + 1,
                                 self.files_in_folder.len()
                             ));
-
                             if let Some(path) = self.files_in_folder.get(self.current_index) {
                                 ui.separator();
-                                ui.label(
-                                    path.file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .to_string(),
-                                );
+                                ui.label(path.file_name().unwrap_or_default().to_string_lossy().to_string());
                             }
-
                             ui.separator();
                             ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
                         }
 
                         if let Some((ref message, _)) = self.status_message {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(message);
-                                },
-                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(message);
+                            });
                         }
                     });
                 });
-
-                if self.show_thumbnail_panel {
-                    egui::SidePanel::right("thumbnail_panel")
-                        .default_width(250.0)
-                        .show_inside(ui, |ui| {
-                            ui.heading("Thumbnails");
-                            ui.separator();
-
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                if self.is_in_archive {
-                                    ui.label("Archive Contents");
-                                    ui.add_space(5.0);
-                                }
-
-                                // Clone the data we need to avoid borrow conflicts
-                                let files: Vec<(usize, PathBuf)> = self
-                                    .files_in_folder
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, path)| (idx, path.clone()))
-                                    .collect();
-
-                                let current_idx = self.current_index;
-
-                                for (idx, file_path) in files.iter() {
-                                    let is_current = *idx == current_idx;
-
-                                    let frame = egui::Frame::default()
-                                        .fill(if is_current {
-                                            Color32::from_rgb(50, 50, 80)
-                                        } else {
-                                            Color32::TRANSPARENT
-                                        })
-                                        .corner_radius(5.0)
-                                        .inner_margin(5.0);
-
-                                    frame.show(ui, |ui| {
-                                        ui.vertical(|ui| {
-                                            let thumb_size = egui::vec2(200.0, 200.0);
-
-                                            if let Some(texture) =
-                                                self.thumbnail_cache.get(file_path)
-                                            {
-                                                let response = ui.add(
-                                                    egui::Image::new(texture)
-                                                        .fit_to_exact_size(thumb_size)
-                                                        .sense(Sense::click()),
-                                                );
-
-                                                if response.clicked() {
-                                                    self.current_index = *idx; // Note the * here
-                                                    if let Some(current_path) = &self.current_path {
-                                                        let current_path_clone =
-                                                            current_path.clone();
-                                                        if self.is_in_archive {
-                                                            let _ = self.load_cbz_image(
-                                                                &current_path_clone,
-                                                                file_path,
-                                                                ctx,
-                                                            );
-                                                        } else {
-                                                            let _ = self.load_image(file_path, ctx);
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                ui.allocate_space(thumb_size);
-                                                ui.label("Loading...");
-                                            }
-
-                                            ui.label(format!("{}", idx + 1));
-                                            ui.label(
-                                                file_path
-                                                    .file_name()
-                                                    .unwrap_or_default()
-                                                    .to_string_lossy()
-                                                    .to_string(),
-                                            );
-                                        });
-                                    });
-
-                                    ui.add_space(5.0);
-                                }
-
-                                if !self.is_in_archive && !self.archive_files.is_empty() {
-                                    ui.separator();
-                                    ui.heading("Archives in Directory");
-                                    ui.add_space(5.0);
-
-                                    let archives: Vec<(usize, PathBuf)> = self
-                                        .archive_files
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(idx, path)| (idx, path.clone()))
-                                        .collect();
-
-                                    let current_archive_idx = self.current_archive_index;
-
-                                    for (idx, archive_path) in archives.iter() {
-                                        let is_current = *idx == current_archive_idx;
-
-                                        let frame = egui::Frame::default()
-                                            .fill(if is_current {
-                                                Color32::from_rgb(50, 50, 80)
-                                            } else {
-                                                Color32::TRANSPARENT
-                                            })
-                                            .corner_radius(5.0)
-                                            .inner_margin(5.0);
-
-                                        frame.show(ui, |ui| {
-                                            ui.vertical(|ui| {
-                                                let thumb_size = egui::vec2(200.0, 200.0);
-
-                                                if let Some(texture) =
-                                                    self.thumbnail_cache.get(archive_path)
-                                                {
-                                                    let response = ui.add(
-                                                        egui::Image::new(texture)
-                                                            .fit_to_exact_size(thumb_size)
-                                                            .sense(Sense::click()),
-                                                    );
-
-                                                    if response.clicked() {
-                                                        let _ = self.open_file(archive_path, ctx);
-                                                    }
-                                                } else {
-                                                    ui.allocate_space(thumb_size);
-                                                    ui.label("Loading...");
-                                                }
-
-                                                ui.label(
-                                                    archive_path
-                                                        .file_name()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy()
-                                                        .to_string(),
-                                                );
-                                            });
-                                        });
-
-                                        ui.add_space(5.0);
-                                    }
-                                }
-                            });
-                        });
-                }
 
                 self.draw_image_view(ui, ctx);
             });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 self.draw_image_view(ui, ctx);
-
                 ui.allocate_space(ui.available_size());
 
                 if !self.files_in_folder.is_empty() {
@@ -1150,12 +812,9 @@ impl App for MangaReader {
                                 ));
 
                                 if let Some((ref message, _)) = self.status_message {
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(message);
-                                        },
-                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(message);
+                                    });
                                 }
                             });
                         });
@@ -1169,7 +828,20 @@ impl MangaReader {
     fn draw_image_view(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let available_size = ui.available_size();
         let image_rect = Rect::from_min_size(ui.cursor().min, available_size);
+
         let response = ui.allocate_rect(image_rect, Sense::drag() | Sense::click());
+
+        // Handle right-click context menu
+        response.context_menu(|ui| {
+            if ui.button("Save Image As...").clicked() {
+                if let Err(e) = self.save_current_image() {
+                    self.set_status(format!("Error saving image: {}", e), 5.0);
+                } else {
+                    self.set_status("Image saved successfully".to_string(), 3.0);
+                }
+                ui.close_menu();
+            }
+        });
 
         if response.drag_started() {
             self.dragging = true;
@@ -1189,12 +861,12 @@ impl MangaReader {
         }
 
         let (scroll, ctrl_held) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.ctrl));
+
         if scroll != 0.0 {
             if ctrl_held {
                 let zoom_factor = if scroll > 0.0 { 1.1 } else { 0.9 };
                 let old_zoom = self.zoom;
                 self.zoom *= zoom_factor;
-
                 self.zoom = self.zoom.clamp(0.1, 10.0);
 
                 if let Some(hover_pos) = response.hover_pos() {
@@ -1233,7 +905,10 @@ impl MangaReader {
                 center_y - scaled_size.y / 2.0 + self.offset_y,
             );
 
-            let image_rect = Rect::from_min_size(position, scaled_size);
+            let image_rect = Rect::from_min_size(
+                position,
+                scaled_size,
+            );
 
             ui.painter().image(
                 image.id(),
@@ -1252,16 +927,12 @@ impl MangaReader {
                     ui.heading("No image loaded");
                     ui.label("Use 'Open File' to load an image or comic archive");
                     ui.label("Or 'Open Directory' to browse a folder of images");
-
                     ui.add_space(20.0);
 
                     ui.horizontal(|ui| {
                         if ui.button("Open File").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter(
-                                    "Comics & Images",
-                                    &["jpg", "jpeg", "png", "webp", "gif", "cbz", "zip"],
-                                )
+                                .add_filter("Comics & Images", &["jpg", "jpeg", "png", "webp", "gif", "cbz", "zip"])
                                 .pick_file()
                             {
                                 if let Err(e) = self.open_file(&path, ctx) {
@@ -1280,21 +951,20 @@ impl MangaReader {
                     });
 
                     ui.add_space(20.0);
-
                     ui.collapsing("Keyboard Shortcuts", |ui| {
                         ui.label("Arrow Left/Right: Previous/Next image");
                         ui.label("Ctrl+Plus/Minus: Zoom in/out");
                         ui.label("F: Fit image to view");
                         ui.label("F11: Toggle fullscreen");
-                        ui.label("T: Toggle thumbnail panel");
                         ui.label("Home/End: First/Last image");
                         ui.label("Space: Next image");
                         ui.label("Delete: Delete current image");
-                        ui.label("Escape: Exit fullscreen/Close panels");
+                        ui.label("Escape: Exit fullscreen");
                         ui.label("Mouse drag: Pan image");
                         ui.label("Mouse wheel: Navigate images");
                         ui.label("Ctrl+Mouse wheel: Zoom in/out");
                         ui.label("Double click: Toggle fullscreen");
+                        ui.label("Right click: Save image as...");
                     });
                 });
             });
@@ -1304,13 +974,11 @@ impl MangaReader {
 
 fn load_icon() -> Option<IconData> {
     let icon_bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/icon.png"));
-
     match image::load_from_memory(icon_bytes) {
         Ok(image) => {
             let image = image.into_rgba8();
             let (width, height) = image.dimensions();
             let rgba = image.into_raw();
-
             Some(IconData {
                 rgba,
                 width,
@@ -1345,6 +1013,5 @@ fn main() -> Result<()> {
         "Manga Reader",
         native_options,
         Box::new(|cc| Ok(Box::new(MangaReader::new(cc)))),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to start application: {}", e))
+    ).map_err(|e| anyhow::anyhow!("Failed to start application: {}", e))
 }
